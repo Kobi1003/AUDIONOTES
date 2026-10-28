@@ -16,71 +16,220 @@ import {
   getExplainerAudioUrl,
 } from "../api";
 
+// ─── Speech Sentence Splitter ────────────────────────────────────────────────
+// Strips markdown and splits into short safe chunks for Chromium TTS.
+function splitSpeechText(text: string): string[] {
+  if (!text) return [];
+
+  // 1. Strip markdown
+  let clean = text
+    .replace(/\*\*(.*?)\*\*/gs, "$1")
+    .replace(/\*(.*?)\*/gs, "$1")
+    .replace(/#{1,6}\s*/g, "")
+    .replace(/`{1,3}[\s\S]*?`{1,3}/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^\s*[-*+>]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\n/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (!clean) return [];
+
+  // 2. Split on sentence boundaries
+  // Use a simple approach that always works: split on ". " "! " "? "
+  const sentences: string[] = [];
+  // Add sentinel so last sentence is always captured
+  const withSentinel = clean.endsWith(".") || clean.endsWith("!") || clean.endsWith("?")
+    ? clean
+    : clean + ".";
+
+  let buf = "";
+  for (let i = 0; i < withSentinel.length; i++) {
+    const ch = withSentinel[i];
+    buf += ch;
+    if ((ch === "." || ch === "!" || ch === "?") && (i + 1 >= withSentinel.length || withSentinel[i + 1] === " " || withSentinel[i + 1] === "\n")) {
+      const s = buf.trim();
+      if (s.length > 0) sentences.push(s);
+      buf = "";
+    }
+  }
+  if (buf.trim()) sentences.push(buf.trim());
+
+  // 3. Hard-split any chunk still >150 chars on comma/semicolon/colon
+  const result: string[] = [];
+  for (const s of sentences) {
+    if (s.length <= 150) {
+      result.push(s);
+    } else {
+      // Split on comma/semicolon/colon
+      const sub = s.split(/(?<=[,;:])\s+/);
+      let acc = "";
+      for (const part of sub) {
+        if ((acc + " " + part).trim().length > 150 && acc.length > 0) {
+          result.push(acc.trim());
+          acc = part;
+        } else {
+          acc = acc ? acc + " " + part : part;
+        }
+      }
+      if (acc.trim()) result.push(acc.trim());
+    }
+  }
+
+  return result.filter(s => s.length > 0);
+}
+
 // ─── Speech Queue ────────────────────────────────────────────────────────────
-// Speaks text in order. Stops listening while speaking to prevent TTS feedback.
+// Fully hardened queue for Chromium Web Speech API.
+// Key fixes vs naive approach:
+//  - onStart fires ONCE per enqueue batch, not per chunk
+//  - keepalive at 5s (Chromium cuts at ~14s, this leaves huge margin)
+//  - watchdog: if speechSynthesis stalls (not speaking but queue has items), force-drain
+//  - onerror for "canceled"/"interrupted" only stops if this was deliberate (stop() called)
 class SpeechQueue {
   private _queue: string[] = [];
   private _busy = false;
+  private _started = false;   // true once the current batch has fired onStart
   private _voice: SpeechSynthesisVoice | null = null;
   private _rate = 0.95;
   private _pitch = 1.0;
   private _activeUtterance: SpeechSynthesisUtterance | null = null;
+  private _keepAliveTimer: any = null;
+  private _watchdogTimer: any = null;
+  private _stopped = false;   // set true by stop(), prevents watchdog from restarting
   onEmpty?: () => void;
   onStart?: () => void;
 
   setVoice(v: SpeechSynthesisVoice | null) { this._voice = v; }
 
   enqueue(texts: string | string[], interrupt = true) {
-    const arr = (Array.isArray(texts) ? texts : [texts]).filter((t) => t.trim().length > 0);
+    const rawArr = Array.isArray(texts) ? texts : [texts];
+    const arr = rawArr.flatMap((t) => splitSpeechText(t)).filter((t) => t.trim().length > 0);
+    if (arr.length === 0) return;
     if (interrupt) {
       this.stop();
     }
+    this._stopped = false;
     this._queue.push(...arr);
     if (!this._busy) this._drain();
   }
 
   stop() {
+    this._stopped = true;
+    this._started = false;
+    this._clearTimers();
     if (this._activeUtterance) {
       this._activeUtterance.onend = null;
       this._activeUtterance.onerror = null;
       this._activeUtterance = null;
     }
-    window.speechSynthesis.cancel();
+    try { window.speechSynthesis.cancel(); } catch {}
     this._queue = [];
     this._busy = false;
   }
 
   get isBusy() { return this._busy; }
 
+  private _clearTimers() {
+    if (this._keepAliveTimer) { clearInterval(this._keepAliveTimer); this._keepAliveTimer = null; }
+    if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
+  }
+
+  private _startKeepAlive() {
+    this._clearTimers();
+    // Keepalive every 5s — well within Chromium's ~14s stall threshold
+    this._keepAliveTimer = setInterval(() => {
+      if (this._stopped) return;
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      } else if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.pause();
+        setTimeout(() => { try { window.speechSynthesis.resume(); } catch {} }, 50);
+      }
+    }, 5000);
+
+    // Watchdog: if we think we're busy but speechSynthesis has gone quiet, re-drain
+    this._armWatchdog();
+  }
+
+  private _armWatchdog() {
+    if (this._watchdogTimer) clearTimeout(this._watchdogTimer);
+    // Give 8s for a chunk to start/finish; if it hasn't, force drain
+    this._watchdogTimer = setTimeout(() => {
+      if (this._stopped || !this._busy) return;
+      if (!window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
+        // Speech engine dropped the ball — force continue
+        if (this._activeUtterance) {
+          this._activeUtterance.onend = null;
+          this._activeUtterance.onerror = null;
+          this._activeUtterance = null;
+        }
+        this._drain();
+      } else {
+        this._armWatchdog(); // still speaking, re-arm
+      }
+    }, 8000);
+  }
+
   private _drain() {
+    if (this._stopped) return;
     if (this._queue.length === 0) {
       this._busy = false;
+      this._started = false;
       this._activeUtterance = null;
+      this._clearTimers();
       this.onEmpty?.();
       return;
     }
+
     this._busy = true;
-    this.onStart?.();
+    // Fire onStart only once per batch (first chunk of the batch)
+    if (!this._started) {
+      this._started = true;
+      this.onStart?.();
+    }
+    this._startKeepAlive();
+
     const text = this._queue.shift()!;
     const u = new SpeechSynthesisUtterance(text);
     u.rate = this._rate;
     u.pitch = this._pitch;
     if (this._voice) u.voice = this._voice;
     this._activeUtterance = u;
+
     u.onend = () => {
+      if (this._stopped) return;
       if (this._activeUtterance === u) {
         this._activeUtterance = null;
         this._drain();
       }
     };
-    u.onerror = () => {
-      if (this._activeUtterance === u) {
-        this._activeUtterance = null;
+
+    u.onerror = (e) => {
+      if (this._activeUtterance !== u) return;
+      this._activeUtterance = null;
+      if (this._stopped) {
+        // Deliberate cancel — clean up
         this._busy = false;
-        this._drain();
+        this._started = false;
+        this._clearTimers();
+        return;
       }
+      // For ANY other error (network, synthesis-failed, audio-busy, etc.) — skip and continue
+      console.warn("[SpeechQueue] utterance error:", e.error, "| text:", text.slice(0, 60));
+      this._drain();
     };
-    window.speechSynthesis.speak(u);
+
+    // Ensure speech engine is not paused before speaking
+    try {
+      if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+      window.speechSynthesis.speak(u);
+    } catch (err) {
+      console.warn("[SpeechQueue] speak() threw:", err);
+      this._drain(); // try next chunk
+    }
   }
 }
 
@@ -240,6 +389,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
   const questionModeRef = useRef(false);
   const isListeningRef = useRef(false);
   const isExitingRef = useRef(false);
+  const lastEnterTimeRef = useRef<number>(0);
   const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sq = useRef(new SpeechQueue());
@@ -320,13 +470,14 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
       const texts: string[] = [
         "Audio Mode activated.",
         "Press the Enter key anytime to stop audio playback and activate your microphone to ask any questions to the agent.",
+        "Press the Enter key twice quickly at any time to exit Audio Mode.",
         "Home screen.",
       ];
       if (docs.length === 0) {
         texts.push("You have no notes yet in your library.");
         texts.push("You can ask any question directly to the AI agent, or say 'upload' to add a document.");
         texts.push("Say 'help' for all available commands.");
-        setStatusText("Audio Mode active. Press Enter to ask a question or say 'upload'.");
+        setStatusText("Audio Mode active. Press Enter to ask a question, or press Enter twice to exit.");
         setCmdHints(["upload", "help"]);
       } else {
         texts.push(`You have ${docs.length} document${docs.length !== 1 ? "s" : ""} in your library.`);
@@ -334,7 +485,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
           texts.push(`Note ${i + 1}: ${d.original_name.replace(/\.(pdf|txt|docx)$/i, "")}.`);
         });
         texts.push("You can speak any question directly, or say 'note 1', 'upload', or 'help'.");
-        setStatusText(`Audio Mode active (${docs.length} note${docs.length !== 1 ? "s" : ""}). Press Enter to ask a question.`);
+        setStatusText(`Audio Mode active (${docs.length} note${docs.length !== 1 ? "s" : ""}). Press Enter to ask a question, or press Enter twice to exit.`);
         setCmdHints([...docs.map((_, i) => `note ${i + 1}`), "upload", "help"]);
       }
       lastAnnouncedRef.current = texts;
@@ -380,16 +531,15 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
             setStreamText(full);
             stopSearchBackgroundMusic();
             playSoundEffect("answer_ready");
-            const sentences = full.match(/[^.!?]+[.!?]+/g) ?? [full];
-            const hasClosingQuestion = full.toLowerCase().includes("help you out") || full.toLowerCase().includes("further questions");
-            const outro = hasClosingQuestion ? [] : ["Is there any other way I can help you out?"];
+            const sentences = splitSpeechText(full);
+            const outro = ["When you are ready, please press the Enter key to continue our conversation."];
             lastAnnouncedRef.current = [...sentences, ...outro];
             sq.current.enqueue([...sentences, ...outro]);
           }
         });
       } catch {
         stopSearchBackgroundMusic();
-        const err = ["I cannot find an answer in the documents.", "Is there any other way I can help you out?"];
+        const err = ["I cannot find an answer in the documents.", "Please press the Enter key to continue our conversation."];
         lastAnnouncedRef.current = err;
         sq.current.enqueue(err);
       }
@@ -463,6 +613,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
             "Say 'upload' to upload a new PDF document.",
             "Say 'repeat' to hear the last announcement again.",
             "Press Enter anytime to start speaking your question.",
+            "Press Enter twice quickly to exit Audio Mode.",
             "Say 'exit voice mode' to switch to standard interface.",
           ],
           note: [
@@ -471,12 +622,14 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
             "Say 'summary' to hear a spoken overview of the document.",
             "Say 'back' to return to your notes list.",
             "Press Enter anytime to speak your question.",
+            "Press Enter twice quickly to exit Audio Mode.",
             "Say 'repeat' to hear the last announcement again.",
           ],
           answering: [
             "Help — answer screen.",
             "Ask another question directly anytime.",
             "Press Enter anytime to interrupt or ask a new question.",
+            "Press Enter twice quickly to exit Audio Mode.",
             "Say 'stop' to stop the answer.",
             "Say 'repeat' to hear the answer again.",
             "Say 'back' to return to the note.",
@@ -484,6 +637,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
           summary: [
             "Help — summary screen.",
             "The audio summary is playing.",
+            "Press Enter twice quickly to exit Audio Mode.",
             "Say 'back' to return to the note.",
           ],
         };
@@ -498,9 +652,9 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
         return;
       }
 
-      if (s.includes("exit voice") || s.includes("standard mode") || s.includes("switch mode")) {
+      if (s.includes("exit voice") || s.includes("exit audio") || s.includes("exit mode") || s.includes("standard mode") || s.includes("switch mode")) {
         stopAllAudio();
-        sq.current.enqueue(["Switching to standard mode. Goodbye."]);
+        sq.current.enqueue(["Exiting audio mode. Returning to home screen. Goodbye."]);
         setTimeout(handleExitVoiceMode, 1800);
         return;
       }
@@ -602,15 +756,14 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
             setStreamText(full);
             stopSearchBackgroundMusic();
             playSoundEffect("answer_ready");
-            const sentences = full.match(/[^.!?]+[.!?]+/g) ?? [full];
-            const hasClosingQuestion = full.toLowerCase().includes("help you out") || full.toLowerCase().includes("further questions");
-            const promptChoice = hasClosingQuestion ? [] : ["Is there any other way I can help you out?"];
-            lastAnnouncedRef.current = [...sentences, ...promptChoice];
-            sq.current.enqueue([...sentences, ...promptChoice]);
+            const sentences = splitSpeechText(full);
+            const outro = ["When you are ready, please press the Enter key to continue our conversation."];
+            lastAnnouncedRef.current = [...sentences, ...outro];
+            sq.current.enqueue([...sentences, ...outro]);
           }
         }).catch(() => {
           stopSearchBackgroundMusic();
-          const err = ["I cannot find an answer in the documents.", "Is there any other way I can help you out?"];
+          const err = ["I cannot find an answer in the documents.", "Please press the Enter key to continue our conversation."];
           lastAnnouncedRef.current = err;
           sq.current.enqueue(err);
         });
@@ -744,9 +897,8 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
       } else {
         isListeningRef.current = false;
         setIsListening(false);
-        if (!sq.current.isBusy && !isExitingRef.current) {
-          restartTimerRef.current = setTimeout(() => startSRRef.current(), 300);
-        }
+        // Do NOT auto-restart mic here — wait for user to press Enter.
+        // startSRRef.current() is only called from handleWakeUp (Enter key).
       }
     };
 
@@ -758,9 +910,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
       }
       isListeningRef.current = false;
       setIsListening(false);
-      if (!sq.current.isBusy && !isExitingRef.current) {
-        restartTimerRef.current = setTimeout(() => startSRRef.current(), 400);
-      }
+      // Do NOT auto-restart mic — user presses Enter to continue.
     };
     recognitionRef.current = r;
 
@@ -793,9 +943,9 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
     };
     sq.current.onEmpty = () => {
       setIsSpeaking(false);
-      if (!isExitingRef.current) {
-        restartTimerRef.current = setTimeout(() => startSRRef.current(), 300);
-      }
+      // Do NOT auto-restart mic — user must press Enter to continue.
+      // This prevents premature mic activation before the user is ready to speak.
+      setStatusText("✅ Answer complete — press Enter to ask your next question, or press Enter twice to exit.");
     };
   }, []);
 
@@ -821,6 +971,58 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
       if (isExitingRef.current) return;
       startSRRef.current();
     }, 150);
+  };
+
+  // ── Double-Enter Exit Action ───────────────────────────────────────────────
+  const handleEnterPress = () => {
+    const now = Date.now();
+    const timeSinceLastEnter = now - lastEnterTimeRef.current;
+    lastEnterTimeRef.current = now;
+
+    if (timeSinceLastEnter > 0 && timeSinceLastEnter < 2000) {
+      // 2nd Enter press within 2 seconds — exit audio mode
+      lastEnterTimeRef.current = 0;
+      isExitingRef.current = true;
+      if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = null; }
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.onend = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.abort();
+        } catch {}
+      }
+      stopAllAudio();
+      setIsListening(false);
+      isListeningRef.current = false;
+      setIsSpeaking(true);
+      setStatusText("🚪 Exiting Audio Mode...");
+
+      try { window.speechSynthesis.cancel(); } catch {}
+      const exitMsg = new SpeechSynthesisUtterance("You pressed Enter twice. Returning to home screen now. Goodbye.");
+      exitMsg.rate = 1.0;
+      let hasExited = false;
+      const doExit = () => {
+        if (hasExited) return;
+        hasExited = true;
+        handleExitVoiceMode();
+      };
+
+      exitMsg.onend = doExit;
+      exitMsg.onerror = doExit;
+
+      // Fallback timeout in case speech synthesis stalls
+      setTimeout(doExit, 3500);
+
+      try {
+        window.speechSynthesis.speak(exitMsg);
+      } catch {
+        doExit();
+      }
+    } else {
+      // 1st Enter press — wake up mic to ask question
+      handleWakeUp();
+    }
   };
 
   // ── Voice loading ──────────────────────────────────────────────────────────
@@ -898,7 +1100,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
         handleResetToStart();
       } else if (e.code === "Enter" || e.code === "NumpadEnter") {
         e.preventDefault();
-        handleWakeUp();
+        handleEnterPress();
       } else if (e.code === "Space" && tag !== "BUTTON") {
         e.preventDefault();
         handleWakeUp();
@@ -969,19 +1171,19 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
             {screen === "summary" && "Playing Audio Summary"}
           </div>
         </div>
-        <button id="bma-exit-btn" className="bma-exit-btn" onClick={handleExitVoiceMode} aria-label="Exit voice mode, return to standard interface" tabIndex={0}>
-          Exit Voice Mode
+        <button id="bma-exit-btn" className="bma-exit-btn" onClick={handleExitVoiceMode} aria-label="Exit audio mode, return to home screen" tabIndex={0}>
+          Exit to Home Screen
         </button>
       </header>
 
       {/* Status orb */}
       <div
         className="bma-orb-area"
-        onClick={handleWakeUp}
+        onClick={handleEnterPress}
         tabIndex={0}
         role="button"
-        aria-label="Activate microphone listening or press Enter key"
-        title="Click or press Enter to wake up voice assistant"
+        aria-label="Press Enter key to speak, or press Enter twice quickly to exit Audio Mode"
+        title="Click or press Enter to speak (Press Enter twice quickly to exit Audio Mode)"
         style={{ cursor: "pointer" }}
       >
         <div className={`bma-orb${isListening ? " bma-orb-listen" : ""}${isSpeaking ? " bma-orb-speak" : ""}`} aria-hidden="true">
@@ -995,7 +1197,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
           ) : <span className="bma-orb-icon">💬</span>}
         </div>
         <div className="bma-orb-label" aria-live="polite" aria-atomic="true">
-          {isListening ? "Listening — speak now (Press Enter to restart)" : isSpeaking ? "Speaking — press Enter to interrupt & speak" : "Click or Press Enter to speak"}
+          {isListening ? "Listening — speak now (Press Enter twice to exit)" : isSpeaking ? "Speaking — press Enter to speak (Enter twice to exit)" : "Press Enter to speak (Press Enter twice to exit)"}
         </div>
       </div>
 

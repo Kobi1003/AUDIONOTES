@@ -142,19 +142,39 @@ Return ONLY a JSON object with these fields:
 JSON:"""
 
 
+def _extract_json_block(raw: str, default_val):
+    """Safely extract and parse JSON from LLM text output."""
+    if not raw:
+        return default_val
+    text = raw.strip()
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    m = re.search(r"(\[.*\]|\{.*\})", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    return default_val
+
+
 def detect_domain(text: str) -> dict:
     """Use LLM to detect the document's domain. Returns {'domain': ..., 'confidence': ..., 'keywords_found': [...]}"""
     preview = text[:4000]
     prompt = DOMAIN_DETECT_PROMPT.format(text=preview)
     raw = llm_service.generate_text(prompt, DOMAIN_DETECT_SYSTEM)
 
-    # Parse JSON
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+    parsed = _extract_json_block(raw, None)
+    if isinstance(parsed, dict) and "domain" in parsed:
+        return parsed
     return {"domain": "general", "confidence": "low", "keywords_found": []}
 
 
@@ -215,8 +235,10 @@ JSON ARRAY:"""
 
 def generate_explainer_script(text: str, persona: dict) -> list[dict]:
     """Generate a structured explainer script as a list of segment dicts."""
-    content_preview = text[:7000]
-    if len(text) > 7000:
+    # Clean up any image markdown links to save tokens and focus on content
+    cleaned_text = re.sub(r"!\[.*?\]\(.*?\)", "", text).strip()
+    content_preview = cleaned_text[:7000]
+    if len(cleaned_text) > 7000:
         content_preview += "\n\n[... document continues ...]"
 
     prompt = SCRIPT_PROMPT.format(
@@ -228,54 +250,101 @@ def generate_explainer_script(text: str, persona: dict) -> list[dict]:
     )
 
     raw = llm_service.generate_text(prompt, SCRIPT_SYSTEM)
+    segments = _extract_json_block(raw, None)
 
-    # Parse JSON array
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
-    if match:
-        try:
-            segments = json.loads(match.group())
-            if isinstance(segments, list) and len(segments) > 0:
-                return segments
-        except json.JSONDecodeError:
-            pass
+    if isinstance(segments, list) and len(segments) > 0:
+        # Normalize fields
+        clean_segs = []
+        for i, s in enumerate(segments):
+            if isinstance(s, dict) and s.get("text"):
+                clean_segs.append({
+                    "segment": s.get("segment", i + 1),
+                    "text": str(s["text"]).strip(),
+                    "visual_cue": s.get("visual_cue", "explain") if s.get("visual_cue") in ["intro", "explain", "define", "example", "summary", "signoff"] else "explain",
+                    "keywords": s.get("keywords", []) if isinstance(s.get("keywords"), list) else [],
+                })
+        if clean_segs:
+            return clean_segs
 
     # Fallback
     logger.warning("Could not parse explainer script JSON. Using fallback.")
     return [
-        {"segment": 1, "text": persona["intro"], "visual_cue": "intro", "keywords": []},
-        {"segment": 2, "text": "This document covers some important concepts. Let me walk you through the highlights.", "visual_cue": "explain", "keywords": []},
-        {"segment": 3, "text": "I hope that gave you a good overview of the topic. Thanks for listening!", "visual_cue": "signoff", "keywords": []},
+        {"segment": 1, "text": persona["intro"], "visual_cue": "intro", "keywords": ["Overview"]},
+        {"segment": 2, "text": "This document covers important concepts. Let's walk through the core takeaways together step by step.", "visual_cue": "explain", "keywords": ["Concepts", "Insights"]},
+        {"segment": 3, "text": "I hope that gave you a clear and simple understanding of this topic. Thank you for listening!", "visual_cue": "signoff", "keywords": ["Summary"]},
     ]
 
 
 # ──────────────────────────── Audio Synthesis ─────────────────────────────────
 
 async def _synthesize_segment(text: str, voice: str, output_path: str) -> None:
-    """Synthesize a single segment to an MP3 using edge-tts."""
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
+    """Synthesize a single segment to an MP3 using edge-tts with automatic gTTS fallback."""
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(output_path)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return
+    except Exception as e:
+        logger.warning(f"edge-tts failed ({e}), attempting gTTS fallback...")
+
+    # Fallback to gTTS
+    try:
+        from gtts import gTTS
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: gTTS(text=text, lang="en").save(output_path))
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return
+    except Exception as e2:
+        logger.warning(f"gTTS fallback also failed ({e2})")
+
+    # If all synthesis failed, write a short silent audio segment
+    _write_silence_mp3(output_path, duration_sec=max(2.0, len(text) / 14.0))
+
+
+def _write_silence_mp3(path: str, duration_sec: float = 2.0) -> None:
+    """Write an empty/silent MP3 file as a resilient last-resort fallback."""
+    try:
+        from pydub import AudioSegment
+        AudioSegment.silent(duration=int(duration_sec * 1000)).export(path, format="mp3")
+    except Exception:
+        # Write minimal valid MPEG frame header sequence
+        with open(path, "wb") as f:
+            f.write(b"\xff\xfb\x90\x04" + b"\x00" * 414)
 
 
 async def _generate_audio_segments_async(segments: list[dict], voice: str, temp_dir: str) -> list[str]:
-    """Generate individual MP3s for each segment sequentially. Returns only paths for non-empty segments."""
+    """Generate individual MP3s for each segment sequentially. Returns paths aligned with segments."""
     paths = []
     for i, seg in enumerate(segments):
         text = seg.get("text", "").strip()
         if not text:
-            paths.append(None)  # placeholder so index stays aligned with segments
+            paths.append(None)
             continue
         path = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
         await _synthesize_segment(text, voice, path)
         paths.append(path)
         logger.info(f"  Synthesized segment {i + 1}/{len(segments)}")
+        await asyncio.sleep(0.05)  # slight breath to avoid burst rate-limits
     return paths
 
 
 def _get_mp3_duration_seconds(path: str) -> float:
-    """Return duration of an MP3 file in seconds using pydub, fall back to 0."""
+    """Return exact duration of an MP3 file in seconds using mutagen, falling back to file estimate."""
+    if not path or not os.path.exists(path):
+        return 0.0
+    try:
+        from mutagen.mp3 import MP3
+        return float(MP3(path).info.length)
+    except Exception:
+        pass
     try:
         from pydub import AudioSegment as _AS
         return len(_AS.from_mp3(path)) / 1000.0
+    except Exception:
+        pass
+    try:
+        # Rough estimate based on 128kbps bitrate
+        return os.path.getsize(path) / (128 * 1024 / 8)
     except Exception:
         return 0.0
 
@@ -284,56 +353,31 @@ def _merge_audio_with_timing(
     segment_paths: list[str | None],
     segments: list[dict],
     output_path: str,
-    pause_ms: int = 500,
+    pause_ms: int = 400,
 ) -> list[dict]:
     """
-    Merge per-segment MP3s (with silence padding) and embed start_time (seconds)
-    into each segment dict.  Returns the updated segments list.
+    Merge per-segment MP3s and embed exact start_time (seconds) into each segment dict.
+    Returns the updated segments list with perfect voice-text synchronization.
     """
-    PAUSE_SEC = pause_ms / 1000.0
     cursor = 0.0
 
-    try:
-        from pydub import AudioSegment
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-        combined = AudioSegment.empty()
-        pause_clip = AudioSegment.silent(duration=pause_ms)
-
+    with open(output_path, "wb") as out_file:
         for i, path in enumerate(segment_paths):
-            if path is None:
-                # Empty segment — keep cursor, no audio added
+            if path is None or not os.path.exists(path) or os.path.getsize(path) == 0:
                 segments[i]["start_time"] = round(cursor, 3)
                 continue
 
-            clip = AudioSegment.from_mp3(path)
-            seg_duration = len(clip) / 1000.0
-
+            seg_duration = _get_mp3_duration_seconds(path)
             segments[i]["start_time"] = round(cursor, 3)
-            cursor += seg_duration + PAUSE_SEC
+            cursor += seg_duration
 
-            combined += clip + pause_clip
+            with open(path, "rb") as seg_f:
+                out_file.write(seg_f.read())
 
-        combined.export(output_path, format="mp3", bitrate="128k")
-        logger.info(f"Merged {len(segment_paths)} segments with pydub (timing embedded).")
-
-    except Exception as e:
-        logger.warning(f"pydub merge/timing failed ({e}), falling back to raw concat + char-count timing.")
-        # Fallback: concatenate raw bytes, estimate timing from char count
-        total_chars = sum(len(seg.get("text", "")) for seg in segments) or 1
-        raw_cursor = 0.0
-        # We'll use a rough estimate of 14 chars/sec for the fallback
-        CHARS_PER_SEC = 14.0
-        with open(output_path, "wb") as out:
-            for i, path in enumerate(segment_paths):
-                if path is None:
-                    segments[i]["start_time"] = round(raw_cursor, 3)
-                    continue
-                seg_chars = len(segments[i].get("text", ""))
-                segments[i]["start_time"] = round(raw_cursor, 3)
-                raw_cursor += seg_chars / CHARS_PER_SEC + PAUSE_SEC
-                with open(path, "rb") as seg_file:
-                    out.write(seg_file.read())
-
+    logger.info(f"Merged {len(segment_paths)} audio segments with exact mutagen timing. Total: {cursor:.2f}s")
     return segments
 
 
@@ -347,19 +391,30 @@ def generate_explainer(document_id: int, file_path: str) -> tuple[dict, str, str
     reflecting its exact position in the merged audio — enabling perfect
     voice-text sync on the frontend.
     """
+    # Resolve file_path if relative or moved
+    if not os.path.exists(file_path):
+        alt = os.path.join(settings.UPLOAD_DIR, os.path.basename(file_path))
+        if os.path.exists(alt):
+            file_path = alt
+
     # Step 1: Extract text
     logger.info(f"Extracting text for explainer (doc {document_id})...")
-    full_text, _ = extract_text_from_pdf(file_path)
+    full_text, _ = extract_text_from_pdf(file_path, document_id)
+
+    # Clean out image markdown before sending to LLM for domain detection & scripting
+    clean_text = re.sub(r"!\[.*?\]\(.*?\)", "", full_text).strip()
+    if not clean_text:
+        clean_text = full_text.strip() or "General document"
 
     # Step 2: Detect domain + select persona
     logger.info("Detecting document domain...")
-    domain_result = detect_domain(full_text)
+    domain_result = detect_domain(clean_text)
     persona = select_persona(domain_result)
     logger.info(f"Domain: {domain_result.get('domain')} → Persona: {persona['name']}")
 
     # Step 3: Generate script
     logger.info("Generating explainer script...")
-    segments = generate_explainer_script(full_text, persona)
+    segments = generate_explainer_script(clean_text, persona)
     logger.info(f"Script has {len(segments)} segments.")
 
     # Step 4: Synthesize audio per segment

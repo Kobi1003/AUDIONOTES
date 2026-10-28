@@ -8,6 +8,7 @@ interface SidebarProps {
   onDocumentUploaded: (doc: Document) => void;
   onDocumentDeleted: (id: number) => void;
   onToast: (msg: string, type: 'success' | 'error' | 'info') => void;
+  onReturnHome?: () => void;
 }
 
 // STATUS_ICONS reserved for status displays
@@ -25,6 +26,7 @@ export function Sidebar({
   onDocumentUploaded,
   onDocumentDeleted,
   onToast,
+  onReturnHome,
 }: SidebarProps) {
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -82,7 +84,15 @@ export function Sidebar({
     <aside className="sidebar">
       {/* Header / Logo */}
       <div className="sidebar-header">
-        <div className="logo">
+        <div
+          className="logo"
+          onClick={onReturnHome}
+          style={onReturnHome ? { cursor: 'pointer' } : undefined}
+          title={onReturnHome ? "Click to return to Home Screen" : undefined}
+          role={onReturnHome ? "button" : undefined}
+          tabIndex={onReturnHome ? 0 : undefined}
+          onKeyDown={onReturnHome ? (e) => { if (e.key === 'Enter' || e.key === ' ') onReturnHome(); } : undefined}
+        >
           <div className="logo-icon">🎙️</div>
           <div>
             <div className="logo-text">AutoNotes AI</div>

@@ -1,0 +1,27 @@
+services:
+  audionotes-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: audionotes-ai
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - AI_PROVIDER=gemini
+      - GEMINI_CHAT_MODEL=gemini-flash-lite-latest
+      - GEMINI_EMBED_MODEL=gemini-embedding-001
+      - PORT=8000
+    volumes:
+      - audionotes-data:/app/backend/uploads
+      - audionotes-indices:/app/backend/vector_indices
+      - audionotes-explainers:/app/backend/explainer_videos
+      - audionotes-podcasts:/app/backend/podcasts
+
+volumes:
+  audionotes-data:
+  audionotes-indices:
+  audionotes-explainers:
+  audionotes-podcasts:
+

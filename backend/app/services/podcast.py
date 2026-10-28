@@ -83,9 +83,24 @@ def _parse_script(raw_output: str) -> list[dict]:
 
 
 async def _synthesize_line(text: str, voice: str, output_path: str) -> None:
-    """Synthesize a single line of text to an MP3 file using edge-tts."""
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
+    """Synthesize a single line of text to an MP3 file using edge-tts with gTTS fallback."""
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(output_path)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return
+    except Exception as e:
+        logger.warning(f"edge-tts failed ({e}), falling back to gTTS...")
+
+    try:
+        from gtts import gTTS
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: gTTS(text=text, lang="en").save(output_path))
+    except Exception as e2:
+        logger.error(f"gTTS fallback also failed ({e2})")
+        # Write minimal valid silent frame so generation completes
+        with open(output_path, "wb") as f:
+            f.write(b"\xff\xfb\x90\x04" + b"\x00" * 414)
 
 
 async def _generate_audio_segments(

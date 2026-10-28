@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+backend/venv
+backend/.env
+backend/autonotes.db
+backend/test_*.png
+backend/**/__pycache__
+frontend/node_modules
+frontend/.vite
+

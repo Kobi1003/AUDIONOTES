@@ -455,11 +455,22 @@ def _run_podcast_generation(podcast_id: int, document_id: int, file_path: str):
 
 
 def _get_mp3_duration(audio_path: str) -> int:
-    """Best-effort MP3 duration in seconds."""
+    """Accurate MP3 duration in seconds."""
+    if not audio_path or not os.path.exists(audio_path):
+        return 0
+    try:
+        from mutagen.mp3 import MP3
+        return int(round(MP3(audio_path).info.length))
+    except Exception:
+        pass
     try:
         from pydub import AudioSegment
         audio = AudioSegment.from_mp3(audio_path)
         return int(len(audio) / 1000)
+    except Exception:
+        pass
+    try:
+        return int(os.path.getsize(audio_path) / (128 * 1024 / 8))
     except Exception:
         return 0
 

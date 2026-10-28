@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+ï»¿import { useState, useEffect, useRef, useCallback } from "react";
 import type { Document, Explainer } from "../api";
 import {
   sendBlindChatStream,
@@ -118,13 +118,59 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
     (text: string) => {
       if (!autoSpeak || !text) return;
       window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = speechRate;
-      if (voices[selectedVoiceIdx]) u.voice = voices[selectedVoiceIdx];
-      u.onstart = () => setIsSpeaking(true);
-      u.onend = () => setIsSpeaking(false);
-      u.onerror = () => setIsSpeaking(false);
-      window.speechSynthesis.speak(u);
+
+      // Strip markdown and split into chunks to avoid Chromium 200-char cutoff
+      const clean = text
+        .replace(/\*\*(.*?)\*\*/g, "$1")
+        .replace(/\*(.*?)\*/g, "$1")
+        .replace(/#{1,6}\s+/g, "")
+        .replace(/`{1,3}[^`]*`{1,3}/g, "")
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+        .replace(/^\s*[-*+]\s+/gm, "")
+        .replace(/^\s*\d+\.\s+/gm, "")
+        .trim();
+
+      const rawParts = clean.split(/(?<=[.!?])\s+|\n+/);
+      const chunks: string[] = [];
+      for (const part of rawParts) {
+        const trimmed = part.trim();
+        if (!trimmed) continue;
+        if (trimmed.length > 180) {
+          const subParts = trimmed.split(/(?<=[,;:])\s+/);
+          for (const sub of subParts) { if (sub.trim()) chunks.push(sub.trim()); }
+        } else {
+          chunks.push(trimmed);
+        }
+      }
+      const finalChunks = chunks.length > 0 ? chunks : [clean];
+
+      // Keepalive to prevent Chromium from stalling long speech
+      const keepAlive = setInterval(() => {
+        if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+          window.speechSynthesis.pause();
+          window.speechSynthesis.resume();
+        }
+      }, 10000);
+
+      let idx = 0;
+      const speakNext = () => {
+        if (idx >= finalChunks.length) {
+          clearInterval(keepAlive);
+          setIsSpeaking(false);
+          return;
+        }
+        const u = new SpeechSynthesisUtterance(finalChunks[idx++]);
+        u.rate = speechRate;
+        if (voices[selectedVoiceIdx]) u.voice = voices[selectedVoiceIdx];
+        if (idx === 1) u.onstart = () => setIsSpeaking(true);
+        u.onend = speakNext;
+        u.onerror = (e) => {
+          if (e.error !== "canceled" && e.error !== "interrupted") speakNext();
+          else { clearInterval(keepAlive); setIsSpeaking(false); }
+        };
+        window.speechSynthesis.speak(u);
+      };
+      speakNext();
     },
     [autoSpeak, speechRate, voices, selectedVoiceIdx]
   );
@@ -199,7 +245,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
         <div className="bc-header-text">
           <h2 className="bc-title">Blind Companion Agent</h2>
           <p className="bc-subtitle" title={document.original_name}>
-            Voice-first accessibility · {document.original_name}
+            Voice-first accessibility ï¿½ {document.original_name}
           </p>
         </div>
         <button
@@ -240,10 +286,10 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
               disabled={isResponding}
               aria-label={
                 isListening
-                  ? "Stop listening — press Space or Enter"
+                  ? "Stop listening ï¿½ press Space or Enter"
                   : isResponding
                   ? "Agent is thinking, please wait"
-                  : "Start voice input — press Space or Enter"
+                  : "Start voice input ï¿½ press Space or Enter"
               }
               aria-pressed={isListening}
             >
@@ -251,7 +297,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
                 {isListening ? "?" : isResponding ? "?" : "??"}
               </span>
               <span className="bc-mic-text">
-                {isListening ? "Listening…" : isResponding ? "Thinking…" : "Tap to Speak"}
+                {isListening ? "Listeningï¿½" : isResponding ? "Thinkingï¿½" : "Tap to Speak"}
               </span>
               <span className="bc-mic-hint" aria-hidden="true">Space</span>
             </button>
@@ -265,7 +311,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
         {(isListening || transcript) && (
           <div className="bc-transcript" role="status" aria-live="assertive">
             <span className="bc-transcript-label" aria-hidden="true">You said:</span>
-            <p className="bc-transcript-text">{transcript || "…"}</p>
+            <p className="bc-transcript-text">{transcript || "ï¿½"}</p>
           </div>
         )}
 
@@ -278,7 +324,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
             id="manual-question-input"
             type="text"
             className="bc-manual-input"
-            placeholder="Or type your question here…"
+            placeholder="Or type your question hereï¿½"
             value={manualInput}
             onChange={(e) => setManualInput(e.target.value)}
             disabled={isResponding}
@@ -335,7 +381,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
             <div className="bc-msg-role" aria-hidden="true">?? Agent</div>
             <p className="bc-msg-content">
               {currentResponse}
-              <span className="bc-cursor" aria-hidden="true">¦</span>
+              <span className="bc-cursor" aria-hidden="true">ï¿½</span>
             </p>
           </div>
         )}
@@ -347,7 +393,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
           <div className="bc-speaking-waves" aria-hidden="true">
             <span /><span /><span /><span /><span />
           </div>
-          <span className="bc-speaking-text">Speaking…</span>
+          <span className="bc-speaking-text">Speakingï¿½</span>
           <button className="bc-stop-btn" onClick={stopSpeaking} aria-label="Stop reading aloud" id="stop-speaking-btn">
             ? Stop
           </button>
@@ -372,7 +418,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
 
           <div className="bc-setting bc-setting-wide">
             <label className="bc-setting-label" htmlFor="speech-rate-slider">
-              Speed: {speechRate.toFixed(1)}×
+              Speed: {speechRate.toFixed(1)}ï¿½
             </label>
             <input
               id="speech-rate-slider"
@@ -413,7 +459,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
       <section className="bc-summary" role="region" aria-label="Document audio summary">
         <h3 className="bc-section-title">?? Listen to Document Summary</h3>
         <p className="bc-summary-desc">
-          Get a complete spoken overview of <strong>{document.original_name}</strong> narrated by an AI expert — no reading required.
+          Get a complete spoken overview of <strong>{document.original_name}</strong> narrated by an AI expert ï¿½ no reading required.
         </p>
 
         {summaryStatus === "idle" && (
@@ -431,7 +477,7 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
         {summaryStatus === "generating" && (
           <div className="bc-generating" role="status" aria-live="polite">
             <div className="bc-spinner" aria-hidden="true" />
-            <p>Generating your audio summary… This takes about a minute.</p>
+            <p>Generating your audio summaryï¿½ This takes about a minute.</p>
           </div>
         )}
 

@@ -23,7 +23,7 @@ def _gemini_generate(prompt: str, system: Optional[str] = None) -> str:
     from google import genai
     from google.genai import types
 
-    candidate_models = [settings.GEMINI_CHAT_MODEL, "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-lite-latest"]
+    candidate_models = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"]
     last_error = None
 
     for model in candidate_models:
@@ -50,7 +50,7 @@ def _gemini_generate_stream(prompt: str, system: Optional[str] = None):
     from google import genai
     from google.genai import types
 
-    candidate_models = [settings.GEMINI_CHAT_MODEL, "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-flash-lite-latest"]
+    candidate_models = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"]
     last_error = None
 
     for model in candidate_models:
@@ -285,13 +285,15 @@ def blind_rag_answer_stream(question: str, context_chunks: list[str], history: O
         "and 'To summarize...' — so the listener can follow along easily.\n"
         "4. Define every technical term out loud the first time you use it.\n"
         "5. Use concrete real-world analogies and everyday comparisons to explain abstract ideas.\n"
-        "6. Keep sentences clear, engaging, and well-paced. Speak naturally and warmly.\n"
+        "6. Keep sentences SHORT and clear. Every sentence must be under 20 words. "
+        "If a thought needs more words, split it into two sentences. Speak naturally and warmly.\n"
         "7. Evaluate the retrieved document context carefully. If the information to answer the question is found in the document context, provide a detailed, accurate response. "
-        "CRITICAL RULE: If the question cannot be answered using the provided document context or if the context is missing, your response MUST be exactly: "
-        "'I cannot find an answer in the documents. Is there any other way I can help you out?' Do not fabricate information not present in the document.\n"
-        "8. If the answer is found in the document, end your answer with exactly one sentence starting with 'In short,' that summarizes the key point.\n"
+        "CRITICAL RULE: If the question cannot be answered using the provided document context or if the context is missing, your response MUST be: "
+        "'I cannot find an answer in the documents.' Do not fabricate information not present in the document.\n"
+        "8. Provide a complete, thorough, and clear explanation of all parts of the question. End your answer with a brief spoken wrap-up of the key takeaway.\n"
         "9. Do NOT start your response with 'Certainly!', 'Sure!', 'Of course!' or similar filler phrases. "
-        "Start directly and confidently with the answer."
+        "Start directly and confidently with the answer.\n"
+        "10. Always complete your full answer. Never cut off mid-explanation."
     )
     prompt = f"""{history_str}Context from the document:
 {context}

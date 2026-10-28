@@ -289,7 +289,7 @@ function App() {
     setBlindMode(blind);
   };
 
-  const handleExitVoiceMode = () => {
+  const handleExitToHome = () => {
     try { window.speechSynthesis.pause(); } catch {}
     try { window.speechSynthesis.cancel(); } catch {}
     document.querySelectorAll("audio, video").forEach((media) => {
@@ -298,9 +298,17 @@ function App() {
         (media as HTMLMediaElement).currentTime = 0;
       } catch {}
     });
-    localStorage.setItem("audionotesAccessibilityMode", "standard");
-    setBlindMode(false);
-    fetchDocs();
+    localStorage.removeItem("audionotesAccessibilityMode");
+    setSelectedDoc(null);
+    setBlindMode(null);
+  };
+
+  const handleExitVoiceMode = () => {
+    handleExitToHome();
+  };
+
+  const handleExitInterfaceMode = () => {
+    handleExitToHome();
   };
 
   const fetchDocs = async () => {
@@ -333,6 +341,20 @@ function App() {
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);
   }, []);
 
+  // Global Escape key in interface mode to return to home
+  useEffect(() => {
+    if (blindMode !== false) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.code === "Escape") {
+        handleExitInterfaceMode();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [blindMode]);
+
   // ── Accessibility gate ─────────────────────────────────────────────────────
   if (blindMode === null) {
     return <AccessibilityGate onChoose={handleChooseMode} />;
@@ -353,11 +375,24 @@ function App() {
         onDocumentUploaded={(doc) => { setDocuments((prev) => [doc, ...prev]); setSelectedDoc(doc); }}
         onDocumentDeleted={(id) => { setDocuments((prev) => prev.filter((d) => d.id !== id)); if (selectedDoc?.id === id) setSelectedDoc(null); }}
         onToast={addToast}
+        onReturnHome={handleExitInterfaceMode}
       />
 
       <main className="main-content">
-        {/* Switch to voice mode button */}
-        <div className="switch-mode-bar">
+        {/* Switch mode bar */}
+        <div className="switch-mode-bar" style={{ display: "flex", gap: "10px", justifyContent: "flex-end", alignItems: "center" }}>
+          <button
+            className="switch-mode-btn"
+            id="exit-to-home-btn"
+            aria-label="Exit Interface Mode and return to Home Screen"
+            onClick={handleExitInterfaceMode}
+            style={{
+              borderColor: "rgba(139,92,246,0.3)",
+              color: "var(--accent-purple, #a855f7)",
+            }}
+          >
+            🏠 Exit to Home Screen
+          </button>
           <button
             className="switch-mode-btn"
             id="switch-to-voice-btn"
