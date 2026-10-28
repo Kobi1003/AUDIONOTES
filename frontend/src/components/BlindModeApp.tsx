@@ -21,7 +21,7 @@ import {
 function splitSpeechText(text: string): string[] {
   if (!text) return [];
 
-  // 1. Strip markdown
+  // 1. Strip markdown and formatting artifacts
   let clean = text
     .replace(/\*\*(.*?)\*\*/gs, "$1")
     .replace(/\*(.*?)\*/gs, "$1")
@@ -37,36 +37,23 @@ function splitSpeechText(text: string): string[] {
 
   if (!clean) return [];
 
-  // 2. Split on sentence boundaries
-  // Use a simple approach that always works: split on ". " "! " "? "
-  const sentences: string[] = [];
-  // Add sentinel so last sentence is always captured
-  const withSentinel = clean.endsWith(".") || clean.endsWith("!") || clean.endsWith("?")
-    ? clean
-    : clean + ".";
+  // 2. Split on sentence boundaries: (. ! ?) followed by whitespace or end of string
+  const rawSentences = clean
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 
-  let buf = "";
-  for (let i = 0; i < withSentinel.length; i++) {
-    const ch = withSentinel[i];
-    buf += ch;
-    if ((ch === "." || ch === "!" || ch === "?") && (i + 1 >= withSentinel.length || withSentinel[i + 1] === " " || withSentinel[i + 1] === "\n")) {
-      const s = buf.trim();
-      if (s.length > 0) sentences.push(s);
-      buf = "";
-    }
-  }
-  if (buf.trim()) sentences.push(buf.trim());
+  const sentences = rawSentences.length > 0 ? rawSentences : [clean];
 
-  // 3. Hard-split any chunk still >150 chars on comma/semicolon/colon
+  // 3. Sub-split any sentence longer than 150 characters on clause boundaries (, ; : -)
   const result: string[] = [];
   for (const s of sentences) {
     if (s.length <= 150) {
       result.push(s);
     } else {
-      // Split on comma/semicolon/colon
-      const sub = s.split(/(?<=[,;:])\s+/);
+      const parts = s.split(/(?<=[,;:\-—])\s+/);
       let acc = "";
-      for (const part of sub) {
+      for (const part of parts) {
         if ((acc + " " + part).trim().length > 150 && acc.length > 0) {
           result.push(acc.trim());
           acc = part;
@@ -78,31 +65,33 @@ function splitSpeechText(text: string): string[] {
     }
   }
 
-  return result.filter(s => s.length > 0);
+  return result.filter((s) => s.length > 0);
 }
 
 // ─── Speech Queue ────────────────────────────────────────────────────────────
-// Fully hardened queue for Chromium Web Speech API.
-// Key fixes vs naive approach:
-//  - onStart fires ONCE per enqueue batch, not per chunk
-//  - keepalive at 5s (Chromium cuts at ~14s, this leaves huge margin)
-//  - watchdog: if speechSynthesis stalls (not speaking but queue has items), force-drain
-//  - onerror for "canceled"/"interrupted" only stops if this was deliberate (stop() called)
+// Fully hardened queue for Chromium / Edge Web Speech API.
+// Key reliability guarantees:
+//  - Zero destructive pause/resume keepalives (which fire onerror "interrupted" in Windows Chromium)
+//  - Anchors active utterance on window.__speechActiveUtterance to prevent V8 GC mid-speech
+//  - Micro-pause (30ms) between chunks so the audio subsystem transitions cleanly
+//  - Per-chunk 14s watchdog that safely advances only if speech engine stalls completely
+//  - OnError gracefully advances to the next chunk rather than aborting playback
 class SpeechQueue {
   private _queue: string[] = [];
   private _busy = false;
-  private _started = false;   // true once the current batch has fired onStart
+  private _started = false;
   private _voice: SpeechSynthesisVoice | null = null;
   private _rate = 0.95;
   private _pitch = 1.0;
   private _activeUtterance: SpeechSynthesisUtterance | null = null;
-  private _keepAliveTimer: any = null;
-  private _watchdogTimer: any = null;
-  private _stopped = false;   // set true by stop(), prevents watchdog from restarting
+  private _chunkWatchdog: any = null;
+  private _stopped = false;
   onEmpty?: () => void;
   onStart?: () => void;
 
-  setVoice(v: SpeechSynthesisVoice | null) { this._voice = v; }
+  setVoice(v: SpeechSynthesisVoice | null) {
+    this._voice = v;
+  }
 
   enqueue(texts: string | string[], interrupt = true) {
     const rawArr = Array.isArray(texts) ? texts : [texts];
@@ -125,72 +114,43 @@ class SpeechQueue {
       this._activeUtterance.onerror = null;
       this._activeUtterance = null;
     }
-    try { window.speechSynthesis.cancel(); } catch {}
+    (window as any).__speechActiveUtterance = null;
+    try {
+      window.speechSynthesis.cancel();
+    } catch {}
     this._queue = [];
     this._busy = false;
   }
 
-  get isBusy() { return this._busy; }
+  get isBusy() {
+    return this._busy;
+  }
 
   private _clearTimers() {
-    if (this._keepAliveTimer) { clearInterval(this._keepAliveTimer); this._keepAliveTimer = null; }
-    if (this._watchdogTimer) { clearTimeout(this._watchdogTimer); this._watchdogTimer = null; }
-  }
-
-  private _startKeepAlive() {
-    this._clearTimers();
-    // Keepalive every 5s — well within Chromium's ~14s stall threshold
-    this._keepAliveTimer = setInterval(() => {
-      if (this._stopped) return;
-      if (window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-      } else if (window.speechSynthesis.speaking) {
-        window.speechSynthesis.pause();
-        setTimeout(() => { try { window.speechSynthesis.resume(); } catch {} }, 50);
-      }
-    }, 5000);
-
-    // Watchdog: if we think we're busy but speechSynthesis has gone quiet, re-drain
-    this._armWatchdog();
-  }
-
-  private _armWatchdog() {
-    if (this._watchdogTimer) clearTimeout(this._watchdogTimer);
-    // Give 8s for a chunk to start/finish; if it hasn't, force drain
-    this._watchdogTimer = setTimeout(() => {
-      if (this._stopped || !this._busy) return;
-      if (!window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
-        // Speech engine dropped the ball — force continue
-        if (this._activeUtterance) {
-          this._activeUtterance.onend = null;
-          this._activeUtterance.onerror = null;
-          this._activeUtterance = null;
-        }
-        this._drain();
-      } else {
-        this._armWatchdog(); // still speaking, re-arm
-      }
-    }, 8000);
+    if (this._chunkWatchdog) {
+      clearTimeout(this._chunkWatchdog);
+      this._chunkWatchdog = null;
+    }
   }
 
   private _drain() {
     if (this._stopped) return;
+    this._clearTimers();
+
     if (this._queue.length === 0) {
       this._busy = false;
       this._started = false;
       this._activeUtterance = null;
-      this._clearTimers();
+      (window as any).__speechActiveUtterance = null;
       this.onEmpty?.();
       return;
     }
 
     this._busy = true;
-    // Fire onStart only once per batch (first chunk of the batch)
     if (!this._started) {
       this._started = true;
       this.onStart?.();
     }
-    this._startKeepAlive();
 
     const text = this._queue.shift()!;
     const u = new SpeechSynthesisUtterance(text);
@@ -198,37 +158,53 @@ class SpeechQueue {
     u.pitch = this._pitch;
     if (this._voice) u.voice = this._voice;
     this._activeUtterance = u;
+    (window as any).__speechActiveUtterance = u; // Anchor to window to prevent V8 GC
 
-    u.onend = () => {
-      if (this._stopped) return;
+    let handled = false;
+    const advance = () => {
+      if (handled) return;
+      handled = true;
+      this._clearTimers();
       if (this._activeUtterance === u) {
         this._activeUtterance = null;
-        this._drain();
       }
+      (window as any).__speechActiveUtterance = null;
+      if (this._stopped) return;
+      // 30ms yield allows browser audio engine to settle cleanly
+      setTimeout(() => {
+        if (!this._stopped) this._drain();
+      }, 30);
+    };
+
+    // Watchdog: If an utterance takes >14s without ending or erroring, force-advance
+    this._chunkWatchdog = setTimeout(() => {
+      console.warn("[SpeechQueue] Chunk watchdog reached 14s, advancing:", text.slice(0, 40));
+      advance();
+    }, 14000);
+
+    u.onend = () => {
+      advance();
     };
 
     u.onerror = (e) => {
-      if (this._activeUtterance !== u) return;
-      this._activeUtterance = null;
       if (this._stopped) {
-        // Deliberate cancel — clean up
         this._busy = false;
         this._started = false;
         this._clearTimers();
         return;
       }
-      // For ANY other error (network, synthesis-failed, audio-busy, etc.) — skip and continue
       console.warn("[SpeechQueue] utterance error:", e.error, "| text:", text.slice(0, 60));
-      this._drain();
+      advance();
     };
 
-    // Ensure speech engine is not paused before speaking
     try {
-      if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
       window.speechSynthesis.speak(u);
     } catch (err) {
       console.warn("[SpeechQueue] speak() threw:", err);
-      this._drain(); // try next chunk
+      advance();
     }
   }
 }
@@ -1103,14 +1079,15 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
   useEffect(() => {
     const load = () => {
       const vs = window.speechSynthesis.getVoices().filter((v) => v.lang.startsWith("en"));
-      const pref = vs.find((v) => 
-        v.name.includes("Natural") || 
-        v.name.includes("Online (Natural)") || 
-        v.name.includes("Google US English") || 
-        v.name.includes("Neural") || 
-        v.name.includes("Google")
-      );
-      sq.current.setVoice(pref ?? vs[0] ?? null);
+      if (vs.length === 0) return;
+      // Prefer high-quality local voices that never stall or require cloud network streaming
+      const pref =
+        vs.find((v) => v.localService && (v.name.includes("Google") || v.name.includes("David") || v.name.includes("Zira") || v.lang === "en-US")) ||
+        vs.find((v) => v.name.includes("Google US English") || v.name.includes("David") || v.name.includes("Zira")) ||
+        vs.find((v) => v.name.includes("Natural") || v.name.includes("Neural")) ||
+        vs.find((v) => v.lang.startsWith("en")) ||
+        vs[0];
+      sq.current.setVoice(pref ?? null);
     };
     load();
     window.speechSynthesis.addEventListener("voiceschanged", load);

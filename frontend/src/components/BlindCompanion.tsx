@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import type { Document, Explainer } from "../api";
 import {
   sendBlindChatStream,
@@ -144,31 +144,35 @@ export function BlindCompanion({ document, onToast }: BlindCompanionProps) {
       }
       const finalChunks = chunks.length > 0 ? chunks : [clean];
 
-      // Keepalive to prevent Chromium from stalling long speech
-      const keepAlive = setInterval(() => {
-        if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
-          window.speechSynthesis.pause();
-          window.speechSynthesis.resume();
-        }
-      }, 10000);
-
       let idx = 0;
       const speakNext = () => {
         if (idx >= finalChunks.length) {
-          clearInterval(keepAlive);
+          (window as any).__companionUtterance = null;
           setIsSpeaking(false);
           return;
         }
         const u = new SpeechSynthesisUtterance(finalChunks[idx++]);
+        (window as any).__companionUtterance = u;
         u.rate = speechRate;
         if (voices[selectedVoiceIdx]) u.voice = voices[selectedVoiceIdx];
         if (idx === 1) u.onstart = () => setIsSpeaking(true);
-        u.onend = speakNext;
-        u.onerror = (e) => {
-          if (e.error !== "canceled" && e.error !== "interrupted") speakNext();
-          else { clearInterval(keepAlive); setIsSpeaking(false); }
+        u.onend = () => {
+          setTimeout(speakNext, 30);
         };
-        window.speechSynthesis.speak(u);
+        u.onerror = (e) => {
+          if (e.error !== "canceled") {
+            setTimeout(speakNext, 30);
+          } else {
+            (window as any).__companionUtterance = null;
+            setIsSpeaking(false);
+          }
+        };
+        try {
+          if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+          window.speechSynthesis.speak(u);
+        } catch {
+          setTimeout(speakNext, 30);
+        }
       };
       speakNext();
     },
