@@ -370,10 +370,24 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
   const wakeUpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileProcessingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const filePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sq = useRef(new SpeechQueue());
   const recognitionRef = useRef<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+
+  // Helper to clear file upload / processing timers
+  const clearFileProcessing = () => {
+    if (fileProcessingTimerRef.current) {
+      clearInterval(fileProcessingTimerRef.current);
+      fileProcessingTimerRef.current = null;
+    }
+    if (filePollRef.current) {
+      clearInterval(filePollRef.current);
+      filePollRef.current = null;
+    }
+  };
 
   // All action functions stored in refs so SR callbacks always have current versions
   const announceHomeRef = useRef<(docs: Document[]) => void>(() => {});
@@ -386,6 +400,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
 
   // Master function to immediately halt all audio playback, speech, and background music
   const stopAllAudio = () => {
+    clearFileProcessing();
     if (wakeUpTimerRef.current) { clearTimeout(wakeUpTimerRef.current); wakeUpTimerRef.current = null; }
     if (enterResetTimerRef.current) { clearTimeout(enterResetTimerRef.current); enterResetTimerRef.current = null; }
     if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = null; }
@@ -1103,6 +1118,12 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
         setScreen("home");
         screenRef.current = "home";
         announceHomeRef.current(docs);
+
+        // If any document is currently being prepared for RAG retrieval, start voice monitoring
+        const pendingDoc = docs.find((d) => d.status === "uploading" || d.status === "ingesting");
+        if (pendingDoc) {
+          monitorProcessingDocument(pendingDoc.id, pendingDoc.original_name);
+        }
       })
       .catch(() => {
         sq.current.enqueue(["Could not connect to the server. Please check that the app is running and refresh the page."]);
@@ -1162,42 +1183,105 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // ── File upload ────────────────────────────────────────────────────────────
+  // ── File upload & Continuous Processing Announcement ─────────────────────
+  const monitorProcessingDocument = (docId: number, cleanName: string) => {
+    clearFileProcessing();
+
+    // Repeating spoken notification every 4.5s so the blind user always knows work is happening
+    fileProcessingTimerRef.current = setInterval(() => {
+      if (isExitingRef.current) {
+        clearFileProcessing();
+        return;
+      }
+      if (!sq.current.isBusy) {
+        sq.current.enqueue(["File is being processed, please wait."], false);
+      }
+    }, 4500);
+
+    // Poll backend status until RAG retrieval preparation is complete
+    filePollRef.current = setInterval(async () => {
+      const upd = await getDocument(docId).catch(() => null);
+      if (!upd) return;
+
+      if (upd.status === "ready") {
+        clearFileProcessing();
+        stopAllAudio();
+        playSoundEffect("answer_ready");
+        setDocuments((prev) => prev.map((d) => (d.id === upd.id ? upd : d)));
+        docsRef.current = docsRef.current.map((d) => (d.id === upd.id ? upd : d));
+        setStatusText(`✅ Note 1: "${cleanName}" is ready.`);
+        const rdy = [
+          `${cleanName} has been processed and is ready for question answering.`,
+          "It is now note 1 in your library. Say 'note 1' to open it, or press Enter to ask a question.",
+        ];
+        lastAnnouncedRef.current = rdy;
+        sq.current.enqueue(rdy, true);
+      } else if (upd.status === "error") {
+        clearFileProcessing();
+        stopAllAudio();
+        setStatusText(`❌ Processing failed for "${cleanName}".`);
+        const err = [`There was a problem processing ${cleanName}. Please try uploading again.`];
+        lastAnnouncedRef.current = err;
+        sq.current.enqueue(err, true);
+      }
+    }, 2000);
+  };
+
   const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     e.target.value = "";
-    const t = [`Uploading ${file.name.replace(/\.pdf$/i, "")}. Please wait.`];
-    lastAnnouncedRef.current = t;
-    sq.current.enqueue(t);
+    const cleanName = file.name.replace(/\.(pdf|txt|docx)$/i, "");
+
+    clearFileProcessing();
+    stopAllAudio();
+    setStatusText(`⏳ Uploading "${cleanName}". File is being processed...`);
+
+    // Initial spoken notification
+    const initialText = [`Uploading ${cleanName}. File is being processed, please wait.`];
+    lastAnnouncedRef.current = initialText;
+    sq.current.enqueue(initialText, true);
+
+    // Continuous voice notification while upload is being prepared for RAG retrieval
+    fileProcessingTimerRef.current = setInterval(() => {
+      if (isExitingRef.current) {
+        clearFileProcessing();
+        return;
+      }
+      if (!sq.current.isBusy) {
+        sq.current.enqueue(["File is being processed, please wait."], false);
+      }
+    }, 4500);
+
     try {
       const doc = await uploadDocument(file);
-      const newDocs = [doc, ...docsRef.current];
+      const newDocs = [doc, ...docsRef.current.filter((d) => d.id !== doc.id)];
       setDocuments(newDocs);
       docsRef.current = newDocs;
-      const succ = [
-        `${file.name.replace(/\.pdf$/i, "")} uploaded successfully.`,
-        "It is being processed. I will let you know when it is ready.",
-        "It is now note 1 in your list.",
-      ];
-      lastAnnouncedRef.current = succ;
-      sq.current.enqueue(succ);
-      const pid = setInterval(async () => {
-        const upd = await getDocument(doc.id).catch(() => null);
-        if (!upd) return;
-        if (upd.status === "ready") {
-          clearInterval(pid);
-          setDocuments((prev) => prev.map((d) => (d.id === upd.id ? upd : d)));
-          const rdy = [`${upd.original_name.replace(/\.pdf$/i, "")} is ready. Say 'note 1' to open it.`];
-          lastAnnouncedRef.current = rdy;
-          sq.current.enqueue(rdy);
-        } else if (upd.status === "error") {
-          clearInterval(pid);
-          sq.current.enqueue([`There was a problem processing ${file.name}. Please try uploading again.`]);
-        }
-      }, 3000);
+
+      if (doc.status === "ready") {
+        clearFileProcessing();
+        stopAllAudio();
+        playSoundEffect("answer_ready");
+        setStatusText(`✅ Note 1: "${cleanName}" is ready.`);
+        const rdy = [
+          `${cleanName} has been processed and is ready for question answering.`,
+          "It is now note 1 in your library. Say 'note 1' to open it, or press Enter to ask a question.",
+        ];
+        lastAnnouncedRef.current = rdy;
+        sq.current.enqueue(rdy, true);
+        return;
+      }
+
+      // Continue monitoring until vector indexing is complete
+      monitorProcessingDocument(doc.id, cleanName);
     } catch (err: any) {
-      sq.current.enqueue([`Upload failed. ${err.message ?? "Please try again."}`]);
+      clearFileProcessing();
+      stopAllAudio();
+      setStatusText(`❌ Upload failed for "${cleanName}".`);
+      const errMsg = [`Upload failed for ${cleanName}. ${err.message ?? "Please try again."}`];
+      lastAnnouncedRef.current = errMsg;
+      sq.current.enqueue(errMsg, true);
     }
   };
 
