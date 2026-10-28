@@ -180,6 +180,7 @@ function AccessibilityGate({ onChoose }: { onChoose: (blind: boolean) => void })
     }, 400);
 
     const handleGlobalKey = (e: KeyboardEvent) => {
+      if (e.repeat) return;
       if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") {
         e.preventDefault();
         handleKeyOrClick();

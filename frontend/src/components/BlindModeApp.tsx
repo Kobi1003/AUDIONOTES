@@ -389,7 +389,9 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
   const questionModeRef = useRef(false);
   const isListeningRef = useRef(false);
   const isExitingRef = useRef(false);
-  const lastEnterTimeRef = useRef<number>(0);
+  const enterCountRef = useRef<number>(0);
+  const enterResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wakeUpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sq = useRef(new SpeechQueue());
@@ -408,6 +410,8 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
 
   // Master function to immediately halt all audio playback, speech, and background music
   const stopAllAudio = () => {
+    if (wakeUpTimerRef.current) { clearTimeout(wakeUpTimerRef.current); wakeUpTimerRef.current = null; }
+    if (enterResetTimerRef.current) { clearTimeout(enterResetTimerRef.current); enterResetTimerRef.current = null; }
     if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = null; }
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
 
@@ -837,13 +841,23 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
 
   // ── Speech Recognition setup ───────────────────────────────────────────────
   useEffect(() => {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) return;
-    const r = new SR();
-    r.continuous = true;
-    r.interimResults = true;
-    r.lang = navigator.language || "en-US";
-    r.maxAlternatives = 1;
+    // Proactively request microphone permission on mount so browser permission prompt appears
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+          stream.getTracks().forEach((track) => track.stop());
+        })
+        .catch((err) => {
+          console.warn("Microphone permission check:", err);
+          if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+            setStatusText("❌ Microphone permission denied. Please allow microphone access in your browser.");
+          }
+        });
+    }
+
+    if (window.location.protocol === "http:" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+      setStatusText("⚠️ Microphone access requires HTTPS. Please access this app over https://");
+    }
 
     let silenceTimer: any = null;
     let accumulatedText = "";
@@ -856,7 +870,9 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
         silenceTimer = null;
       }
 
-      try { r.stop(); } catch {}
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch {}
+      }
       isListeningRef.current = false;
       setIsListening(false);
 
@@ -870,68 +886,119 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
       }
     };
 
-    r.onresult = (e: any) => {
-      let fullTranscript = "";
-      for (let i = 0; i < e.results.length; ++i) {
-        fullTranscript += e.results[i][0].transcript + " ";
-      }
-      const cleanText = fullTranscript.trim();
-
-      if (cleanText) {
-        accumulatedText = cleanText;
-        setStatusText(`🎤 Hearing: "${cleanText}"…`);
-        if (silenceTimer) clearTimeout(silenceTimer);
-        // 1.8s silence threshold for reliable full-sentence detection
-        silenceTimer = setTimeout(() => {
-          submitSpeech();
-        }, 1800);
-      }
-    };
-
-    r.onend = () => {
-      if (isExitingRef.current) return;
-      if (silenceTimer) {
-        try { r.start(); } catch {}
-      } else if (accumulatedText.trim()) {
-        submitSpeech();
-      } else {
-        isListeningRef.current = false;
-        setIsListening(false);
-        // Do NOT auto-restart mic here — wait for user to press Enter.
-        // startSRRef.current() is only called from handleWakeUp (Enter key).
-      }
-    };
-
-    r.onerror = (_e: any) => {
-      if (isExitingRef.current) return;
-      if (silenceTimer) {
-        clearTimeout(silenceTimer);
-        silenceTimer = null;
-      }
-      isListeningRef.current = false;
-      setIsListening(false);
-      // Do NOT auto-restart mic — user presses Enter to continue.
-    };
-    recognitionRef.current = r;
-
     startSRRef.current = () => {
-      if (isExitingRef.current || isListeningRef.current || sq.current.isBusy) return;
+      if (isExitingRef.current || sq.current.isBusy) return;
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
       if (silenceTimer) clearTimeout(silenceTimer);
       accumulatedText = "";
+
+      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (!SR) {
+        setStatusText("❌ Speech Recognition is not supported in this browser. Please use Google Chrome or Microsoft Edge.");
+        return;
+      }
+
+      // Safely cleanup previous recognition instance
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onend = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.abort();
+        } catch {}
+        recognitionRef.current = null;
+      }
+
+      const r = new SR();
+      r.continuous = true;
+      r.interimResults = true;
+      r.lang = navigator.language || "en-US";
+      r.maxAlternatives = 1;
+
+      r.onresult = (e: any) => {
+        let fullTranscript = "";
+        for (let i = 0; i < e.results.length; ++i) {
+          fullTranscript += e.results[i][0].transcript + " ";
+        }
+        const cleanText = fullTranscript.trim();
+
+        if (cleanText) {
+          accumulatedText = cleanText;
+          setStatusText(`🎤 Hearing: "${cleanText}"…`);
+          if (silenceTimer) clearTimeout(silenceTimer);
+          silenceTimer = setTimeout(() => {
+            submitSpeech();
+          }, 1800);
+        }
+      };
+
+      r.onend = () => {
+        if (isExitingRef.current) return;
+        if (silenceTimer) {
+          try { r.start(); } catch {}
+        } else if (accumulatedText.trim()) {
+          submitSpeech();
+        } else {
+          isListeningRef.current = false;
+          setIsListening(false);
+        }
+      };
+
+      r.onerror = (e: any) => {
+        console.warn("[SpeechRecognition] error:", e.error);
+        if (isExitingRef.current) return;
+        if (silenceTimer) {
+          clearTimeout(silenceTimer);
+          silenceTimer = null;
+        }
+        isListeningRef.current = false;
+        setIsListening(false);
+
+        if (e.error === "not-allowed") {
+          setStatusText("❌ Microphone permission denied. Please allow microphone access in your browser.");
+          sq.current.enqueue(["Microphone permission was denied. Please allow microphone access in your browser address bar."]);
+        } else if (e.error === "network") {
+          setStatusText("⚠️ Speech recognition network issue. Please check your internet connection.");
+        }
+      };
+
+      recognitionRef.current = r;
+
       try {
         r.start();
         isListeningRef.current = true;
         setIsListening(true);
         setStatusText("🎤 Listening — speak your question to the agent now...");
         playSoundEffect("listen_start");
-      } catch {}
+      } catch (err) {
+        console.warn("Initial speech recognition start threw, retrying:", err);
+        setTimeout(() => {
+          try {
+            r.start();
+            isListeningRef.current = true;
+            setIsListening(true);
+            setStatusText("🎤 Listening — speak your question to the agent now...");
+            playSoundEffect("listen_start");
+          } catch (retryErr) {
+            console.error("SpeechRecognition retry failed:", retryErr);
+          }
+        }, 150);
+      }
     };
+
     stopSRRef.current = () => {
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
       if (silenceTimer) clearTimeout(silenceTimer);
       accumulatedText = "";
-      try { r.abort(); } catch {}
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onend = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.abort();
+        } catch {}
+        recognitionRef.current = null;
+      }
       isListeningRef.current = false;
       setIsListening(false);
     };
@@ -943,8 +1010,6 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
     };
     sq.current.onEmpty = () => {
       setIsSpeaking(false);
-      // Do NOT auto-restart mic — user must press Enter to continue.
-      // This prevents premature mic activation before the user is ready to speak.
       setStatusText("✅ Answer complete — press Enter to ask your next question, or press Enter twice to exit.");
     };
   }, []);
@@ -952,7 +1017,6 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
   // ── Manual Wake-Up Action (Enter Key / Space / Orb click) ───────────────────
   const handleWakeUp = () => {
     isExitingRef.current = false;
-    // 1. Immediately halt all active speech synthesis, queue, ambient music, and audio elements
     sq.current.stop();
     try { window.speechSynthesis.pause(); } catch {}
     try { window.speechSynthesis.cancel(); } catch {}
@@ -960,14 +1024,12 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
     setIsSpeaking(false);
 
     if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = null; }
-    if (recognitionRef.current) {
-      try { recognitionRef.current.abort(); } catch {}
-    }
-    isListeningRef.current = false;
-    setIsListening(false);
+    if (wakeUpTimerRef.current) { clearTimeout(wakeUpTimerRef.current); wakeUpTimerRef.current = null; }
+    stopSRRef.current();
 
-    // 2. Allow 150ms for speech synthesis audio to flush completely before starting mic
-    setTimeout(() => {
+    // 150ms buffer for hardware audio pipeline
+    wakeUpTimerRef.current = setTimeout(() => {
+      wakeUpTimerRef.current = null;
       if (isExitingRef.current) return;
       startSRRef.current();
     }, 150);
@@ -975,23 +1037,30 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
 
   // ── Double-Enter Exit Action ───────────────────────────────────────────────
   const handleEnterPress = () => {
-    const now = Date.now();
-    const timeSinceLastEnter = now - lastEnterTimeRef.current;
-    lastEnterTimeRef.current = now;
+    // If a reset timer was running from the 1st press, clear it
+    if (enterResetTimerRef.current) {
+      clearTimeout(enterResetTimerRef.current);
+      enterResetTimerRef.current = null;
+    }
 
-    if (timeSinceLastEnter > 0 && timeSinceLastEnter < 2000) {
-      // 2nd Enter press within 2 seconds — exit audio mode
-      lastEnterTimeRef.current = 0;
+    enterCountRef.current += 1;
+
+    if (enterCountRef.current >= 2) {
+      // Double Enter confirmed!
+      enterCountRef.current = 0;
       isExitingRef.current = true;
-      if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = null; }
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.onend = null;
-          recognitionRef.current.onerror = null;
-          recognitionRef.current.onresult = null;
-          recognitionRef.current.abort();
-        } catch {}
+
+      // Cancel any pending wake up immediately
+      if (wakeUpTimerRef.current) {
+        clearTimeout(wakeUpTimerRef.current);
+        wakeUpTimerRef.current = null;
       }
+      if (restartTimerRef.current) {
+        clearTimeout(restartTimerRef.current);
+        restartTimerRef.current = null;
+      }
+
+      stopSRRef.current();
       stopAllAudio();
       setIsListening(false);
       isListeningRef.current = false;
@@ -1011,7 +1080,6 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
       exitMsg.onend = doExit;
       exitMsg.onerror = doExit;
 
-      // Fallback timeout in case speech synthesis stalls
       setTimeout(doExit, 3500);
 
       try {
@@ -1019,10 +1087,16 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
       } catch {
         doExit();
       }
-    } else {
-      // 1st Enter press — wake up mic to ask question
-      handleWakeUp();
+      return;
     }
+
+    // 1st Enter press — trigger wake up and start 900ms window for double press
+    handleWakeUp();
+
+    enterResetTimerRef.current = setTimeout(() => {
+      enterCountRef.current = 0;
+      enterResetTimerRef.current = null;
+    }, 900);
   };
 
   // ── Voice loading ──────────────────────────────────────────────────────────
@@ -1094,6 +1168,7 @@ export function BlindModeApp({ onExitVoiceMode }: BlindModeAppProps) {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.repeat) return; // Prevent key repeat when Enter key is held down
 
       if (e.code === "Escape") {
         e.preventDefault();
